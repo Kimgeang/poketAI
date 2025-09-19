@@ -1,50 +1,83 @@
-from flask import Flask, request, jsonify, render_template
-import tensorflow as tf
-import numpy as np
-from tensorflow.keras.preprocessing import image
-import os
+import torch
+from torch import nn
+from torchvision import transforms
+from PIL import Image
+from flask import Flask, render_template, request, jsonify
+import io
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
 
-# 1. 학습된 모델 로드
-# model = tf.keras.models.load_model('model/pokemon_like_model.h5')
+# -----------------------------
+# device 설정 (GPU 사용)
+# -----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# 2. 이미지 전처리 함수
-def preprocess_img(img_path):
-    img = image.load_img(img_path, target_size=(224,224))
-    x = image.img_to_array(img)
-    x = np.expand_dims(x, axis=0)/255.0
-    return x
+# -----------------------------
+# 모델 정의
+# -----------------------------
+class MyCNN(nn.Module):
+    def __init__(self):
+        super(MyCNN, self).__init__()
+        self.conv = nn.Conv2d(3, 16, 3)  # 예시 CNN
+        self.fc = nn.Linear(16*62*62, 2)  # 2 클래스 예시
 
-# 3. 메인 페이지 (이미지 업로드)
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+# -----------------------------
+# 모델 로드 (GPU로 이동, 일부 checkpoint 적용)
+# -----------------------------
+checkpoint = torch.load('model.pth', map_location=device)
+model = MyCNN().to(device)
+model_dict = model.state_dict()
+
+# fc 제외하고 checkpoint 불러오기
+pretrained_dict = {k: v.to(device) for k, v in checkpoint.items() if k in model_dict and 'fc' not in k}
+model_dict.update(pretrained_dict)
+model.load_state_dict(model_dict)
+model.eval()
+
+# -----------------------------
+# 이미지 전처리 함수
+# -----------------------------
+transform = transforms.Compose([
+    transforms.Resize((64, 64)),  # conv 입력 크기 맞춤
+    transforms.ToTensor()
+])
+
+def preprocess_image(file_bytes):
+    img = Image.open(io.BytesIO(file_bytes)).convert('RGB')
+    img = transform(img)
+    img = img.unsqueeze(0)  # 배치 차원 추가
+    return img.to(device)
+
+# -----------------------------
+# 서버 엔드포인트
+# -----------------------------
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
-# 4. 이미지 업로드 후 예측
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"})
+        return jsonify({'error': 'No file provided'}), 400
     
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No file selected"})
+    img_tensor = preprocess_image(file.read())
     
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    file.save(filepath)
-
-    x = preprocess_img(filepath)
-    preds = model.predict(x)
-    class_idx = np.argmax(preds)
-    confidence = float(np.max(preds))
+    with torch.no_grad():
+        output = model(img_tensor)
+        pred = torch.argmax(output, dim=1).item()
     
-    # 클래스 이름 mapping 필요 (train_generator.class_indices 사용)
-    class_names = ['pikachu_like','charizard_like']
-    result = class_names[class_idx]
+    return jsonify({'prediction': pred})
 
-    return jsonify({"result": result, "confidence": confidence})
-
-if __name__ == "__main__":
+# -----------------------------
+if __name__ == '__main__':
     app.run(debug=True)
