@@ -1,111 +1,113 @@
-# 1️⃣ 라이브러리 불러오기
-from tensorflow.keras.applications import ResNet50   # ImageNet 사전학습 모델
-from tensorflow.keras import layers, models          # 레이어, 모델 구성
-from tensorflow.keras.optimizers import Adam         # 옵티마이저
-from tensorflow.keras.preprocessing.image import ImageDataGenerator  # 데이터 증강
-from tensorflow.keras.callbacks import TensorBoard
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from torch.utils.tensorboard import SummaryWriter
 import datetime
 
+# -------------------------------
+# TensorBoard SummaryWriter 설정
+# -------------------------------
+log_dir = "runs/exp_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+writer = SummaryWriter(log_dir=log_dir)
 
+# GPU 설정
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("사용 중인 장치:", device)
 
+# -------------------------------
+# 데이터셋 로더
+# -------------------------------
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
+])
 
-# =========================================
-# 2️⃣ 데이터 준비 & 증강
-# =========================================
-train_datagen = ImageDataGenerator(
-    rescale=1./255,          # 0~255 픽셀 값을 0~1로 정규화
-    rotation_range=30,       # 이미지 회전
-    width_shift_range=0.4,   # 좌우 이동
-    height_shift_range=0.4,  # 상하 이동
-    horizontal_flip=True     # 좌우 반전
-)
+train_dataset = datasets.ImageFolder(root="dataset/train", transform=transform)
+val_dataset   = datasets.ImageFolder(root="dataset/val", transform=transform)
 
-val_datagen = ImageDataGenerator(rescale=1./255)  # 검증 데이터는 정규화만
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-train_generator = train_datagen.flow_from_directory(
-    r'C:\Users\Administrator\Desktop\test\dataset\train',
-    target_size=(224,224),   # ResNet50 입력 크기
-    batch_size=8,
-    class_mode='categorical'
-)
+# -------------------------------
+# 모델 정의 (사전학습된 ResNet18 사용)
+# -------------------------------
+model = models.resnet18(pretrained=True)
+num_features = model.fc.in_features
+model.fc = nn.Linear(num_features, len(train_dataset.classes))
+model = model.to(device)
 
-val_generator = val_datagen.flow_from_directory(
-    r'C:\Users\Administrator\Desktop\test\dataset\val',
-    target_size=(224,224),
-    batch_size=8,
-    class_mode='categorical'
-)
+# -------------------------------
+# 손실 함수 & 옵티마이저
+# -------------------------------
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-num_pokemon_classes = train_generator.num_classes  # 포켓몬 클래스 수 자동 설정
+# -------------------------------
+# 학습 + 검증 루프
+# -------------------------------
+num_epochs = 100
+for epoch in range(num_epochs):
+    # ===== 학습 모드 =====
+    model.train()
+    running_loss, running_corrects = 0.0, 0
 
-# =========================================
-# 3️⃣ 사전학습 모델 불러오기
-# =========================================
-base_model = ResNet50(
-    weights='imagenet',       # ImageNet으로 학습된 가중치 사용
-    include_top=False,         # 기존 출력층 제거
-    input_shape=(224,224,3)
-)
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
 
-# =========================================
-# 4️⃣ 출력층 구성
-# =========================================
-x = base_model.output
-x = layers.GlobalAveragePooling2D()(x)       # 특징 맵을 1차원 벡터로 변환
-x = layers.Dense(1024, activation='relu')(x) # Dense 층으로 포켓몬 특징 학습
-predictions = layers.Dense(num_pokemon_classes, activation='softmax')(x)  # 포켓몬 클래스 수 출력층
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
 
-model = models.Model(inputs=base_model.input, outputs=predictions)  # base_model + 새 출력층 결합
+        _, preds = torch.max(outputs, 1)
+        running_loss += loss.item() * inputs.size(0)
+        running_corrects += torch.sum(preds == labels.data)
 
-log_dir = "logs/pokemon_finetune/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-tensorboard_callback = TensorBoard(log_dir=log_dir, histogram_freq=1)
+    train_loss = running_loss / len(train_dataset)
+    train_acc = running_corrects.double() / len(train_dataset)
 
+    # ===== 검증 모드 =====
+    model.eval()
+    val_loss, val_corrects = 0.0, 0
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
 
+            _, preds = torch.max(outputs, 1)
+            val_loss += loss.item() * inputs.size(0)
+            val_corrects += torch.sum(preds == labels.data)
 
-# =========================================
-# 5️⃣ 초기 학습: 기본 층 동결
-# =========================================
-for layer in base_model.layers:
-    layer.trainable = False  # ImageNet에서 학습된 특징은 그대로 사용
+    val_loss = val_loss / len(val_dataset)
+    val_acc = val_corrects.double() / len(val_dataset)
 
-# 모델 컴파일
-model.compile(
-    optimizer='adam',                         # Adam 옵티마이저
-    loss='categorical_crossentropy',          # 다중 클래스 손실
-    metrics=['accuracy']                      # 정확도 평가
-)
+    # ===== 출력 =====
+    print(f"[Epoch {epoch+1}/{num_epochs}] "
+          f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+          f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
 
-# 출력층만 학습
-model.fit(
-    train_generator,
-    validation_data=val_generator,
-    epochs=5,
-    callbacks=[tensorboard_callback]   # TensorBoard 콜백 추가
-)
+    # ===== TensorBoard 기록 =====
+    writer.add_scalar("Loss/train", train_loss, epoch)
+    writer.add_scalar("Accuracy/train", train_acc, epoch)
+    writer.add_scalar("Loss/val", val_loss, epoch)
+    writer.add_scalar("Accuracy/val", val_acc, epoch)
 
-# =========================================
-# 6️⃣ Fine-Tuning: 상위 층 일부 학습
-# =========================================
-for layer in base_model.layers[-10:]:          # 마지막 10개 층만 학습 가능
-    layer.trainable = True
+# -------------------------------
+# 모델 구조 기록 (한 번만)
+# -------------------------------
+example_inputs, _ = next(iter(train_loader))
+writer.add_graph(model, example_inputs.to(device))
 
-# 낮은 학습률로 재컴파일
-model.compile(
-    optimizer=Adam(1e-5),                      # 안정적 Fine-Tuning
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
+writer.close()
 
-# Fine-Tuning 학습
-model.fit(
-    train_generator,
-    validation_data=val_generator,
-    epochs=20,
-    callbacks=[tensorboard_callback]   # TensorBoard 콜백 추가
-
-)
-
-# =========================================
-# 7️⃣ 모델 저장
-# =========================================
-model.save('pokemon_finetuned_resnet50.h5')   # 학습 완료 모델 저장
+# -------------------------------
+# 모델 저장
+# -------------------------------
+torch.save(model.state_dict(), "model.pth")
+print("모델 저장 완료: model.pth")
